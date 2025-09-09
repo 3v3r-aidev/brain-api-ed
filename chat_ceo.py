@@ -5,7 +5,7 @@
 # ✅ Core deps: streamlit, pandas
 # 🔌 Optional (for Google Drive persistence on Streamlit Cloud):
 #     google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
-# 🧩 Your existing modules are used if present:
+# 🧩 Uses your existing modules if present:
 #     file_parser.py, embed_and_store.py, answer_with_rag.py (function: answer)
 
 import json
@@ -428,34 +428,45 @@ elif mode == "📜 View History":
 
 
 # ─────────────────────────────────────────────────────────────
-# 🔁 Page: REFRESH DATA (Parsing + Embeddings)
+# 🔁 Page: REFRESH DATA (single button: Parse ➜ Embed & Store)
 # ─────────────────────────────────────────────────────────────
 elif mode == "🔁 Refresh Data":
     st.title("🔁 Refresh Data")
     st.write("📥 Parse & 🧩 Embed your documents so the assistant answers with the latest context.")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("📥 Parse Documents"):
+    # One-click pipeline: Parse -> Embed & Store
+    if st.button("🚀 Parse & Embed (One Click)"):
+        ok = True
+
+        # Step 1: Parse
+        with st.spinner("📥 Parsing documents..."):
             if file_parser and hasattr(file_parser, "main"):
                 try:
                     file_parser.main()
                     st.success("✅ Parsing complete.")
                 except Exception as e:
                     st.error(f"❌ Parsing failed: {e}")
+                    ok = False
             else:
                 st.warning("⚠️ file_parser.main() not found.")
+                ok = False
 
-    with c2:
-        if st.button("🧩 Embed & Store"):
-            if embed_and_store and hasattr(embed_and_store, "main"):
-                try:
-                    embed_and_store.main()
-                    save_refresh_time()
-                    st.success("✅ Embeddings stored.")
-                except Exception as e:
-                    st.error(f"❌ Embedding failed: {e}")
-            else:
-                st.warning("⚠️ embed_and_store.main() not found.")
+        # Step 2: Embed & Store (only if parse succeeded)
+        if ok:
+            with st.spinner("🧩 Creating embeddings & storing..."):
+                if embed_and_store and hasattr(embed_and_store, "main"):
+                    try:
+                        embed_and_store.main()
+                        save_refresh_time()
+                        st.success("✅ Embeddings stored.")
+                    except Exception as e:
+                        st.error(f"❌ Embedding failed: {e}")
+                        ok = False
+                else:
+                    st.warning("⚠️ embed_and_store.main() not found.")
+                    ok = False
+
+        if ok:
+            st.balloons()
 
     st.caption(f"🕒 Last refresh: {load_refresh_time()}")
