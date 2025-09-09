@@ -1,14 +1,24 @@
 # =========================
-# 🧠 AI CEO Assistant + 🗂️ Embedded Chat Hub (Single Streamlit App)
+# 🧠 AI CEO Assistant + 🗂️ Chat Hub (Emoji + Diagnostics, Single File)
 # =========================
-# 👉 Copy-paste this entire file as: chat_ceo.py
+# 👉 Save as: chat_ceo.py
 # ✅ Core deps: streamlit, pandas
-# 🔌 Optional (for Google Drive persistence on Streamlit Cloud):
-#     google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
-# 🧩 Uses your existing modules if present:
-#     file_parser.py, embed_and_store.py, answer_with_rag.py (function: answer)
+# 🧩 Works even if file_parser.py, embed_and_store.py, or answer_with_rag.py are missing.
+# 🛠️ Features:
+#   - 🗂️ Multi-conversation sidebar (create/search/select/rename/delete)
+#   - 💬 Chat UI (stores to SQLite)
+#   - 📜 DB-backed history + CSV export
+#   - 🚀 One-click Parse ➜ Embed pipeline
+#   - 🧪 Diagnostics panel (env/DB/status/errors)
+#
+# If you later add:
+#   - file_parser.main()
+#   - embed_and_store.main()
+#   - answer_with_rag.answer()
+# this UI will automatically use them.
 
 import json
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -19,108 +29,30 @@ import pandas as pd
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
-# 🧩 Try to import your existing modules (safe fallbacks if missing)
+# 🧩 Optional imports (safe if missing)
 # ─────────────────────────────────────────────────────────────
-try:
-    import file_parser
-except Exception:
-    file_parser = None
-
-try:
-    import embed_and_store
-except Exception:
-    embed_and_store = None
-
-try:
-    from answer_with_rag import answer as rag_answer
-except Exception:
-    rag_answer = None
-
-
-# ─────────────────────────────────────────────────────────────
-# ☁️ Optional Google Drive Sync (best-effort; no-op if libs/secrets missing)
-# ─────────────────────────────────────────────────────────────
-def _init_drive_sync():
+_last_exception = None
+def _try_import(name, attr=None):
+    """Import helper that never crashes the app; records the last exception."""
+    global _last_exception
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-    except Exception:
-        return {"enabled": False, "reason": "google client libs not installed"}
-
-    if "gdrive" not in st.secrets:
-        return {"enabled": False, "reason": "no gdrive secrets"}
-
-    try:
-        creds = service_account.Credentials.from_service_account_info(
-            dict(st.secrets["gdrive"]),
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-        )
-        service = build("drive", "v3", credentials=creds)
-        return {"enabled": True, "service": service}
+        mod = __import__(name)
+        return getattr(mod, attr) if attr else mod
     except Exception as e:
-        return {"enabled": False, "reason": f"init error: {e}"}
+        _last_exception = f"Import error for {name}: {e}"
+        return None
 
-
-def _drive_find_file(service, name, folder_id=None):
-    q = f"name = '{name}' and trashed = false"
-    if folder_id:
-        q += f" and '{folder_id}' in parents"
-    r = service.files().list(q=q, fields="files(id,name)").execute()
-    files = r.get("files", [])
-    return files[0]["id"] if files else None
-
-
-def drive_download_db(ctx, db_name="chats.db"):
-    if not ctx.get("enabled"):
-        return False
-    service = ctx["service"]
-    file_id = _drive_find_file(service, db_name, st.secrets["gdrive"].get("folder_id"))
-    if not file_id:
-        return False
-    from googleapiclient.http import MediaIoBaseDownload
-    import io
-
-    req = service.files().get_media(fileId=file_id)
-    with io.FileIO(db_name, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, req)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-    return True
-
-
-def drive_upload_db(ctx, db_name="chats.db"):
-    if not ctx.get("enabled"):
-        return False
-    service = ctx["service"]
-    from googleapiclient.http import MediaIoBaseUpload
-    import os
-
-    if not Path(db_name).exists():
-        return False
-    file_id = _drive_find_file(service, db_name, st.secrets["gdrive"].get("folder_id"))
-    media = MediaIoBaseUpload(open(db_name, "rb"), mimetype="application/octet-stream", resumable=False)
-    meta = {"name": db_name}
-    folder_id = st.secrets["gdrive"].get("folder_id")
-    if folder_id:
-        meta["parents"] = [folder_id]
-    if file_id:
-        service.files().update(fileId=file_id, media_body=media).execute()
-    else:
-        service.files().create(body=meta, media_body=media, fields="id").execute()
-    return True
-
-
-DRIVE_CTX = _init_drive_sync()
-if DRIVE_CTX.get("enabled"):
-    try:
-        drive_download_db(DRIVE_CTX)  # best-effort restore DB on startup
-    except Exception:
-        pass
-
+file_parser = _try_import("file_parser")                         # expects file_parser.main()
+embed_and_store = _try_import("embed_and_store")                 # expects embed_and_store.main()
+rag_answer = _try_import("answer_with_rag", "answer")            # expects answer_with_rag.answer()
 
 # ─────────────────────────────────────────────────────────────
-# 🗂️ Embedded SQLite DB (self-contained; no external db.py needed)
+# ⚙️ App config
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="🧠 AI CEO Assistant", page_icon="🧠", layout="wide")
+
+# ─────────────────────────────────────────────────────────────
+# 🗄️ SQLite (embedded, hardened for Streamlit threads)
 # ─────────────────────────────────────────────────────────────
 DB_PATH = Path("chats.db")
 SCHEMA = """
@@ -142,19 +74,26 @@ CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 """
 
+def _connect():
+    # check_same_thread=False avoids issues under Streamlit's threaded runtime
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 @contextmanager
 def _conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute("PRAGMA foreign_keys = ON;")
-    yield conn
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 def db_init():
     with _conn() as conn:
         for stmt in SCHEMA.strip().split(";"):
-            if stmt.strip():
-                conn.execute(stmt)
+            s = stmt.strip()
+            if s:
+                conn.execute(s)
 
 def db_new_conversation(title: str) -> int:
     now = datetime.now().isoformat(timespec="seconds")
@@ -168,10 +107,8 @@ def db_new_conversation(title: str) -> int:
 def db_rename_conversation(conv_id: int, title: str):
     now = datetime.now().isoformat(timespec="seconds")
     with _conn() as conn:
-        conn.execute(
-            "UPDATE conversations SET title=?, updated_at=? WHERE id=?",
-            (title.strip() or "Untitled", now, conv_id),
-        )
+        conn.execute("UPDATE conversations SET title=?, updated_at=? WHERE id=?",
+                     (title.strip() or "Untitled", now, conv_id))
 
 def db_delete_conversation(conv_id: int):
     with _conn() as conn:
@@ -204,36 +141,42 @@ def db_get_messages(conv_id: int):
             (conv_id,),
         ).fetchall()
 
-
 # ─────────────────────────────────────────────────────────────
-# 🗃️ Legacy JSON history (kept for backward compatibility)
+# 🗃️ Legacy JSON (kept for compatibility; optional)
 # ─────────────────────────────────────────────────────────────
 HIST_PATH = Path("chat_history.json")
 REFRESH_PATH = Path("last_refresh.txt")
 
 def load_history():
-    if HIST_PATH.exists():
-        return json.loads(HIST_PATH.read_text(encoding="utf-8"))
+    try:
+        if HIST_PATH.exists():
+            return json.loads(HIST_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        st.warning(f"⚠️ History load error: {e}")
     return []
 
 def save_history(history):
-    HIST_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def reset_chat():
-    if HIST_PATH.exists():
-        HIST_PATH.unlink()
+    try:
+        HIST_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        st.warning(f"⚠️ History save error: {e}")
 
 def save_refresh_time():
-    REFRESH_PATH.write_text(datetime.now().strftime("%b-%d-%Y %I:%M %p"))
+    try:
+        REFRESH_PATH.write_text(datetime.now().strftime("%b-%d-%Y %I:%M %p"))
+    except Exception as e:
+        st.warning(f"⚠️ Refresh timestamp save error: {e}")
 
 def load_refresh_time():
-    if REFRESH_PATH.exists():
-        return REFRESH_PATH.read_text(encoding="utf-8")
+    try:
+        if REFRESH_PATH.exists():
+            return REFRESH_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        st.warning(f"⚠️ Refresh timestamp read error: {e}")
     return "N/A"
 
-
 # ─────────────────────────────────────────────────────────────
-# 🔐 Minimal Login (replace with your auth if needed)
+# 🔐 Minimal login (replace with your own if needed)
 # ─────────────────────────────────────────────────────────────
 USERNAME = "admin123"
 PASSWORD = "BestOrg123@#"
@@ -253,76 +196,89 @@ def login():
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
+# ─────────────────────────────────────────────────────────────
+# 🏁 App init
+# ─────────────────────────────────────────────────────────────
+db_init()
+
+# Seed an active conversation once
+if "active_conv" not in st.session_state:
+    try:
+        st.session_state["active_conv"] = db_new_conversation("🧾 Default Conversation")
+    except Exception as e:
+        _last_exception = f"DB seed error: {e}"
 
 # ─────────────────────────────────────────────────────────────
-# ⚙️ App Config + DB init
+# 🧪 Diagnostics (sidebar)
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="🧠 AI CEO Assistant", page_icon="🧠", layout="wide")
-db_init()  # ensure schema
+with st.sidebar.expander("🧪 Diagnostics", expanded=True):
+    st.code({
+        "cwd": os.getcwd(),
+        "db_file_exists": DB_PATH.exists(),
+        "db_size_bytes": DB_PATH.stat().st_size if DB_PATH.exists() else 0,
+        "has_file_parser": bool(file_parser),
+        "has_embed_and_store": bool(embed_and_store),
+        "has_rag_answer": bool(rag_answer),
+        "last_exception": _last_exception,
+    }, language="json")
 
+# Auth gate
 if not st.session_state["authenticated"]:
     login()
     st.stop()
 
-
 # ─────────────────────────────────────────────────────────────
-# 🗂️ Sidebar — Conversations (Embedded Chat Hub)
+# 🗂️ Sidebar — Conversations (Chat Hub)
 # ─────────────────────────────────────────────────────────────
 st.sidebar.subheader("🗂️ Conversations")
 
-# Ensure one active conversation exists
-if "active_conv" not in st.session_state:
-    st.session_state["active_conv"] = db_new_conversation("🧾 Default Conversation")
-
-# ➕ New conversation
 with st.sidebar.expander("➕ New Conversation"):
-    _new_title = st.text_input("📝 Title", placeholder="e.g., Buyer agreement review")
+    new_title = st.text_input("📝 Title", placeholder="e.g., Buyer agreement review")
     if st.button("✅ Create"):
-        _cid = db_new_conversation(_new_title or "Untitled")
-        st.session_state["active_conv"] = _cid
         try:
-            drive_upload_db(DRIVE_CTX)
-        except Exception:
-            pass
-        st.rerun()
+            cid = db_new_conversation(new_title or "Untitled")
+            st.session_state["active_conv"] = cid
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Create conversation failed: {e}")
 
-# 🔎 Search & list
-_search = st.sidebar.text_input("🔎 Search")
-_convs = db_list_conversations(_search)
-if not _convs:
+search = st.sidebar.text_input("🔎 Search")
+try:
+    convs = db_list_conversations(search)
+except Exception as e:
+    convs = []
+    st.sidebar.error(f"❌ List conversations failed: {e}")
+
+if not convs:
     st.sidebar.caption("ℹ️ No conversations yet.")
 else:
-    for _cid, _title, _, _ in _convs:
-        if st.sidebar.button(_title or f"Conversation {_cid}", key=f"conv_sel_{_cid}"):
-            st.session_state["active_conv"] = _cid
+    for cid, title, _, _ in convs:
+        if st.sidebar.button(title or f"Conversation {cid}", key=f"conv_sel_{cid}"):
+            st.session_state["active_conv"] = cid
             st.rerun()
 
-# ✏️ Rename / 🗑️ Delete
-_acid = st.session_state.get("active_conv")
-if _acid:
+acid = st.session_state.get("active_conv")
+if acid:
     st.sidebar.markdown("---")
-    _current_title = next((t for i, t, _, _ in _convs if i == _acid), "Untitled") if _convs else "Untitled"
-    _new_name = st.sidebar.text_input("✏️ Rename", value=_current_title)
+    current_title = next((t for i, t, _, _ in convs if i == acid), "Untitled") if convs else "Untitled"
+    new_name = st.sidebar.text_input("✏️ Rename", value=current_title)
     c1, c2 = st.sidebar.columns(2)
     with c1:
         if st.button("💾 Save Name", key="conv_rename"):
-            db_rename_conversation(_acid, _new_name or "Untitled")
             try:
-                drive_upload_db(DRIVE_CTX)
-            except Exception:
-                pass
-            st.rerun()
+                db_rename_conversation(acid, new_name or "Untitled")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"❌ Rename failed: {e}")
     with c2:
         if st.button("🗑️ Delete", key="conv_delete"):
-            db_delete_conversation(_acid)
             try:
-                drive_upload_db(DRIVE_CTX)
-            except Exception:
-                pass
-            remain = db_list_conversations("")
-            st.session_state["active_conv"] = remain[0][0] if remain else db_new_conversation("🧾 Default Conversation")
-            st.rerun()
-
+                db_delete_conversation(acid)
+                remain = db_list_conversations("")
+                st.session_state["active_conv"] = remain[0][0] if remain else db_new_conversation("🧾 Default Conversation")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"❌ Delete failed: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # 🧭 Sidebar — App Navigation
@@ -330,18 +286,37 @@ if _acid:
 mode = st.sidebar.radio("🧭 Navigation", ["💬 New Chat", "📜 View History", "🔁 Refresh Data"], index=0)
 st.sidebar.markdown("---")
 st.sidebar.checkbox("🗂️ Limit to meeting docs only", value=False, key="limit_meetings")
-st.sidebar.caption("💡 Tip: start a message with **REMINDER:** to save a reminder text file.")
-
+st.sidebar.caption("💡 Tip: start a message with **REMINDER:** to save a reminder text file in `./reminders`.")
 
 # ─────────────────────────────────────────────────────────────
-# 💬 Page: NEW CHAT
+# 🤖 Safe answer() wrapper (uses stub if missing)
+# ─────────────────────────────────────────────────────────────
+def _safe_answer(query: str, k: int = 7, chat_history=None, restrict_to_meetings: bool = False) -> str:
+    """Call your RAG answer() if available; otherwise return a safe stub."""
+    global _last_exception
+    if rag_answer is None:
+        return f"(stub) You asked: {query}"
+    try:
+        return rag_answer(query, k=k, chat_history=chat_history, restrict_to_meetings=restrict_to_meetings)
+    except TypeError:
+        # Handle different signatures gracefully
+        try:
+            return rag_answer(query)
+        except Exception as e:
+            _last_exception = f"rag_answer call failed: {e}"
+            return f"(stub) You asked: {query}"
+    except Exception as e:
+        _last_exception = f"rag_answer error: {e}"
+        return f"(stub) You asked: {query}"
+
+# ─────────────────────────────────────────────────────────────
+# 💬 Page: New Chat
 # ─────────────────────────────────────────────────────────────
 if mode == "💬 New Chat":
     st.title("💬 New Chat")
-    history = load_history()  # legacy JSON kept so your old chat flow still renders above
-
-    # Show prior turns (legacy JSON)
-    for turn in history:
+    # Render legacy JSON turns (optional)
+    legacy = load_history()
+    for turn in legacy:
         role = turn.get("role", "assistant")
         with st.chat_message("user" if role == "user" else "assistant"):
             st.markdown(f"🗨️ [{turn.get('timestamp', 'N/A')}]  \n{turn.get('content', '')}")
@@ -349,67 +324,65 @@ if mode == "💬 New Chat":
     user_msg = st.chat_input("✍️ Type your question or add a REMINDER…")
     if user_msg:
         # 1) 📝 REMINDER shortcut
-        if user_msg.strip().lower().startswith("reminder:"):
-            body = re.sub(r"^reminder:\s*", "", user_msg.strip(), flags=re.I)
-            title_hint = (body.split("\n", 1)[0] or "Reminder")[:60]
-            folder = Path("reminders"); folder.mkdir(exist_ok=True)
-            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{re.sub(r'[^a-zA-Z0-9._ -]+','_',title_hint)}.txt"
-            path = folder / fname
-            path.write_text(body, encoding="utf-8")
-            st.success(f"💾 Reminder saved: `{path}`")
+        try:
+            if user_msg.strip().lower().startswith("reminder:"):
+                body = re.sub(r"^reminder:\s*", "", user_msg.strip(), flags=re.I)
+                title_hint = (body.split("\n", 1)[0] or "Reminder")[:60]
+                folder = Path("reminders"); folder.mkdir(exist_ok=True)
+                fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{re.sub(r'[^a-zA-Z0-9._ -]+','_',title_hint)}.txt"
+                path = folder / fname
+                path.write_text(body, encoding="utf-8")
+                st.success(f"💾 Reminder saved: `{path}`")
+        except Exception as e:
+            st.warning(f"⚠️ Reminder save failed: {e}")
 
         # 2) 🧾 Append to legacy JSON
         now = datetime.now().strftime("%b-%d-%Y %I:%M%p")
-        history.append({"role": "user", "content": user_msg, "timestamp": now})
-        save_history(history)
+        legacy.append({"role": "user", "content": user_msg, "timestamp": now})
+        save_history(legacy)
 
-        # 3) 🧱 Mirror to SQLite (active conversation)
+        # 3) 🧱 Mirror into SQLite
         try:
             db_add_message(st.session_state["active_conv"], "user", user_msg, ts=now)
-        except Exception:
-            pass
+        except Exception as e:
+            st.warning(f"⚠️ DB add (user) failed: {e}")
 
-        # 4) 🤖 Get assistant reply via your RAG pipeline
+        # 4) 🤖 Get assistant reply
         with st.chat_message("assistant"):
             st.markdown("🧠 Thinking…")
             try:
-                if rag_answer is not None:
-                    reply = rag_answer(
-                        user_msg,
-                        k=7,
-                        chat_history=history,
-                        restrict_to_meetings=st.session_state["limit_meetings"],
-                    )
-                else:
-                    reply = "⚠️ answer_with_rag.answer() not available. Please ensure the module is present."
-            except TypeError:
-                # Fallback if your answer() signature differs
-                reply = rag_answer(user_msg) if rag_answer else "⚠️ answer() missing."
+                reply = _safe_answer(
+                    user_msg,
+                    k=7,
+                    chat_history=legacy,
+                    restrict_to_meetings=st.session_state["limit_meetings"],
+                )
             except Exception as e:
                 reply = f"❌ Error: {e}"
-
             ts = datetime.now().strftime("%b-%d-%Y %I:%M%p")
             st.markdown(f"🧾 [{ts}]  \n{reply}")
 
-        # 5) 💽 Save assistant turn (JSON + DB + best-effort Drive upload)
-        history.append({"role": "assistant", "content": reply, "timestamp": ts})
-        save_history(history)
+        # 5) 💽 Save assistant turn (JSON + DB)
+        legacy.append({"role": "assistant", "content": reply, "timestamp": ts})
+        save_history(legacy)
         try:
             db_add_message(st.session_state["active_conv"], "assistant", reply, ts=ts)
-            drive_upload_db(DRIVE_CTX)
-        except Exception:
-            pass
+        except Exception as e:
+            st.warning(f"⚠️ DB add (assistant) failed: {e}")
 
         st.rerun()
 
-
 # ─────────────────────────────────────────────────────────────
-# 📜 Page: VIEW HISTORY (DB-backed)
+# 📜 Page: View History (DB-backed)
 # ─────────────────────────────────────────────────────────────
 elif mode == "📜 View History":
     st.title("📜 Conversation History")
     cid = st.session_state.get("active_conv")
-    msgs = db_get_messages(cid) if cid else []
+    try:
+        msgs = db_get_messages(cid) if cid else []
+    except Exception as e:
+        msgs = []
+        st.error(f"❌ Load messages failed: {e}")
 
     if not msgs:
         st.info("ℹ️ No messages in this conversation yet.")
@@ -426,9 +399,8 @@ elif mode == "📜 View History":
             mime="text/csv",
         )
 
-
 # ─────────────────────────────────────────────────────────────
-# 🔁 Page: REFRESH DATA (single button: Parse ➜ Embed & Store)
+# 🔁 Page: Refresh Data (single button: Parse ➜ Embed & Store)
 # ─────────────────────────────────────────────────────────────
 elif mode == "🔁 Refresh Data":
     st.title("🔁 Refresh Data")
@@ -470,3 +442,4 @@ elif mode == "🔁 Refresh Data":
             st.balloons()
 
     st.caption(f"🕒 Last refresh: {load_refresh_time()}")
+
