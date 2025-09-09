@@ -15,9 +15,9 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conv_id INTEGER NOT NULL,
-    role TEXT NOT NULL,         
+    role TEXT NOT NULL,
     content TEXT NOT NULL,
-    ts TEXT NOT NULL,           
+    ts TEXT NOT NULL,
     FOREIGN KEY(conv_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id);
